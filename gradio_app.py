@@ -378,7 +378,15 @@ def generation_all(
     tmp_time = time.time()
 
     text_path = os.path.join(save_folder, f'textured_mesh.obj')
-    path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+    try:
+        logger.info("Starting texture generation...")
+        path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+        logger.info("Texture generation completed successfully")
+    except Exception as e:
+        logger.error(f"Texture generation failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
         
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
