@@ -52,6 +52,9 @@ fi
 
 echo ""
 
+# Set CUDA arch for all builds — GB10 is sm_121 (Blackwell)
+export TORCH_CUDA_ARCH_LIST="12.1"
+
 # Remove old venv if exists
 if [ -d "venv" ]; then
     echo "Removing existing virtual environment..."
@@ -68,9 +71,11 @@ echo "Upgrading pip..."
 pip install --upgrade pip wheel setuptools
 
 # Install PyTorch with CUDA 13.0 support
+# Note: Stable PyTorch may not support sm_121 (GB10 Blackwell).
+# Use nightly builds which include newer GPU architecture support.
 echo ""
-echo "Installing PyTorch with CUDA 13.0 support..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+echo "Installing PyTorch nightly with CUDA 13.0 support (needed for sm_121/GB10)..."
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
 
 # Verify PyTorch CUDA
 echo ""
@@ -170,7 +175,7 @@ echo "=============================================="
 echo ""
 echo "Building custom rasterizer..."
 cd hy3dpaint/custom_rasterizer
-TORCH_CUDA_ARCH_LIST="12.1" pip install --no-build-isolation -e . || echo "WARNING: custom_rasterizer build failed"
+pip install --no-build-isolation -e . || echo "WARNING: custom_rasterizer build failed"
 cd ../..
 
 # Compile DifferentiableRenderer
