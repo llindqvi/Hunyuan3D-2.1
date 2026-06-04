@@ -351,6 +351,34 @@ def unload_pipelines():
     return {"status": "already_unloaded"}
 
 
+def _read_meminfo_kb() -> dict:
+    """/proc/meminfo as {key: kB}, or {} when unreadable."""
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts:
+                    info[key] = int(parts[0])  # kB
+    except OSError:
+        pass
+    return info
+
+
+_unified_memory_cached = None
+
+
+def _is_unified_memory() -> bool:
+    global _unified_memory_cached
+    if _unified_memory_cached is None:
+        try:
+            _unified_memory_cached = torch.cuda.get_device_properties(0).is_integrated
+        except Exception:
+            _unified_memory_cached = False
+    return _unified_memory_cached
+
+
 def _vram_info_mb() -> tuple:
     """(free_mb, total_mb) for /state, or (None, None) when unavailable.
 
@@ -362,14 +390,8 @@ def _vram_info_mb() -> tuple:
     try:
         if not torch.cuda.is_available():
             return None, None
-        if torch.cuda.get_device_properties(0).is_integrated:
-            info = {}
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    key, _, rest = line.partition(":")
-                    parts = rest.split()
-                    if parts:
-                        info[key] = int(parts[0])  # kB
+        if _is_unified_memory():
+            info = _read_meminfo_kb()
             avail, total = info.get("MemAvailable"), info.get("MemTotal")
             if avail is None or total is None:
                 return None, None
@@ -378,6 +400,74 @@ def _vram_info_mb() -> tuple:
         return free_b // (1024 * 1024), total_b // (1024 * 1024)
     except Exception:
         return None, None
+
+
+# --- Unified-memory page-cache survival (mirrors shared/cuda_memory.py in the
+# live-stack repo). On GB10, cudaMalloc fails when kernel MemFree is low even
+# though MemAvailable (reclaimable page cache) is plentiful; NVIDIA's
+# workaround is dropping the page cache. Requires a privileged container
+# (writable /proc/sys); silently skipped otherwise — no CPU-buffer fallback,
+# that thrashes once swap fills.
+
+_PAGE_CACHE_RESERVE_GB = int(os.environ.get("PAGE_CACHE_RESERVE_GB", "20"))
+_PAGE_CACHE_COOLDOWN_S = 5.0
+_page_cache_last_drop = 0.0
+_drop_caches_denied_logged = False
+
+
+def _try_drop_caches() -> bool:
+    try:
+        os.sync()
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+        return True
+    except OSError:
+        return False
+
+
+def free_page_cache_if_needed() -> None:
+    global _page_cache_last_drop, _drop_caches_denied_logged
+    if not _is_unified_memory():
+        return
+    now = time.monotonic()
+    if now - _page_cache_last_drop < _PAGE_CACHE_COOLDOWN_S:
+        return
+    free_kb = _read_meminfo_kb().get("MemFree")
+    if free_kb is None or free_kb >= _PAGE_CACHE_RESERVE_GB * 1024 * 1024:
+        return
+    _page_cache_last_drop = now
+    if _try_drop_caches():
+        logger.info(
+            "Dropped page cache (MemFree was %.1f GB, reserve %d GB)",
+            free_kb / 1024 / 1024, _PAGE_CACHE_RESERVE_GB,
+        )
+    elif not _drop_caches_denied_logged:
+        _drop_caches_denied_logged = True
+        logger.warning(
+            "Cannot drop page cache (/proc/sys read-only — container not "
+            "privileged?); cudaMalloc may fail under page-cache pressure",
+        )
+
+
+def _patch_module_to() -> None:
+    """Drop page cache before any ``.to(cuda)`` move. Idempotent."""
+    if getattr(torch.nn.Module.to, "_page_cache_patched", False):
+        return
+    _orig = torch.nn.Module.to
+
+    def _patched(self, *args, **kwargs):
+        device = kwargs.get("device")
+        if device is None and args and isinstance(args[0], (str, torch.device)):
+            device = args[0]
+        if device is not None and "cuda" in str(device):
+            free_page_cache_if_needed()
+        return _orig(self, *args, **kwargs)
+
+    _patched._page_cache_patched = True
+    torch.nn.Module.to = _patched
+
+
+_patch_module_to()
 
 
 @app.get("/state")
@@ -710,6 +800,7 @@ def convert_image_to_3d(
         # GPU access (the scheduler has mutable state that is not thread-safe).
         cancel = preemption.begin(cancel_previous=cancel_previous)
         preemption.check(cancel)
+        free_page_cache_if_needed()
 
         # Get pipelines and process
         shape_pipeline, texture_pipeline, rembg = pipeline_manager.get_pipelines(

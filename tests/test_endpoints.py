@@ -387,3 +387,41 @@ class TestUnloadWaitsForSlot:
         # Slot must be free again afterwards.
         assert api_module.preemption.wait_idle(timeout=1.0)
         api_module.preemption.release_slot()
+
+
+class TestPageCacheDrop:
+    """free_page_cache_if_needed — unified-memory survival helper."""
+
+    def test_noop_on_discrete_gpu(self, monkeypatch):
+        import api as api_module
+
+        monkeypatch.setattr(api_module, "_is_unified_memory", lambda: False)
+        calls = []
+        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
+        api_module.free_page_cache_if_needed()
+        assert calls == []
+
+    def test_drops_when_memfree_low(self, monkeypatch):
+        import api as api_module
+
+        monkeypatch.setattr(api_module, "_is_unified_memory", lambda: True)
+        monkeypatch.setattr(api_module, "_read_meminfo_kb", lambda: {"MemFree": 1024})
+        monkeypatch.setattr(api_module, "_page_cache_last_drop", 0.0)
+        calls = []
+        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
+        api_module.free_page_cache_if_needed()
+        assert calls == [1]
+
+    def test_skips_when_memfree_high(self, monkeypatch):
+        import api as api_module
+
+        monkeypatch.setattr(api_module, "_is_unified_memory", lambda: True)
+        monkeypatch.setattr(
+            api_module, "_read_meminfo_kb",
+            lambda: {"MemFree": (api_module._PAGE_CACHE_RESERVE_GB + 1) * 1024 * 1024},
+        )
+        monkeypatch.setattr(api_module, "_page_cache_last_drop", 0.0)
+        calls = []
+        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
+        api_module.free_page_cache_if_needed()
+        assert calls == []
