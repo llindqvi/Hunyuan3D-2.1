@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, './hy3dshape')
 sys.path.insert(0, './hy3dpaint')
 
+import functools
 import gc
 import glob
 import logging
@@ -100,9 +101,6 @@ class PreemptionManager:
         """
         return self._processing.acquire(timeout=timeout)
 
-    def release_slot(self) -> None:
-        self._processing.release()
-
     @staticmethod
     def check(cancel: threading.Event) -> None:
         """Raise ``PreemptedError`` if this request has been superseded."""
@@ -133,62 +131,56 @@ class PipelineManager:
         them. On abort (or any failure) partially-loaded pipelines are
         dropped so the next request sees a consistent unloaded state.
         """
-        def _ck() -> None:
-            if check_cancel is not None:
-                check_cancel()
-
+        check_cancel = check_cancel or (lambda: None)
         load_start = time.time()
         logger.info("Loading ML pipelines...")
         try:
-            self._load_pipelines_inner(_ck, load_start)
+            from hy3dshape.rembg import BackgroundRemover
+            from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+            from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+
+            # Apply torchvision fix if available
+            try:
+                from torchvision_fix import apply_fix
+                apply_fix()
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+            # Load shape generation pipeline
+            t = time.time()
+            logger.info("Loading shape generation pipeline...")
+            model_path = 'tencent/Hunyuan3D-2.1'
+            self._shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
+            logger.info("Shape pipeline loaded in %.2fs", time.time() - t)
+
+            t = time.time()
+            self._shape_pipeline.enable_flashvdm(replace_vae=False, mc_algo='mc')
+            logger.info("FlashVDM enabled in %.2fs", time.time() - t)
+
+            check_cancel()  # checkpoint: shape pipeline up, texture load not yet started
+
+            self._rembg = BackgroundRemover()
+
+            check_cancel()  # checkpoint: before the texture pipeline load
+
+            # Load texture generation pipeline
+            t = time.time()
+            logger.info("Loading texture generation pipeline...")
+            max_num_view = 4
+            resolution = 512
+            conf = Hunyuan3DPaintConfig(max_num_view, resolution, texture_steps=8)
+            conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+            conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+            conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+            self._texture_pipeline = Hunyuan3DPaintPipeline(conf)
+            logger.info("Texture pipeline loaded in %.2fs", time.time() - t)
+
+            logger.info("All ML pipelines loaded in %.2fs", time.time() - load_start)
         except BaseException:
             self._unload_locked(reason="aborted mid-load")
             raise
-
-    def _load_pipelines_inner(self, _ck, load_start) -> None:
-        from hy3dshape.rembg import BackgroundRemover
-        from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
-        from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-
-        # Apply torchvision fix if available
-        try:
-            from torchvision_fix import apply_fix
-            apply_fix()
-        except ImportError:
-            pass
-        except Exception:
-            pass
-
-        # Load shape generation pipeline
-        t = time.time()
-        logger.info("Loading shape generation pipeline...")
-        model_path = 'tencent/Hunyuan3D-2.1'
-        self._shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-        logger.info("Shape pipeline loaded in %.2fs", time.time() - t)
-
-        t = time.time()
-        self._shape_pipeline.enable_flashvdm(replace_vae=False, mc_algo='mc')
-        logger.info("FlashVDM enabled in %.2fs", time.time() - t)
-
-        _ck()  # checkpoint: shape pipeline up, texture load not yet started
-
-        self._rembg = BackgroundRemover()
-
-        _ck()  # checkpoint: before the texture pipeline load
-
-        # Load texture generation pipeline
-        t = time.time()
-        logger.info("Loading texture generation pipeline...")
-        max_num_view = 4
-        resolution = 512
-        conf = Hunyuan3DPaintConfig(max_num_view, resolution, texture_steps=8)
-        conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-        conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-        conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-        self._texture_pipeline = Hunyuan3DPaintPipeline(conf)
-        logger.info("Texture pipeline loaded in %.2fs", time.time() - t)
-
-        logger.info("All ML pipelines loaded in %.2fs", time.time() - load_start)
 
     def get_pipelines(self, check_cancel=None) -> tuple[ShapePipeline, TexturePipeline, BackgroundRemoverType]:
         """Get the ML pipelines, loading them if needed.
@@ -202,16 +194,18 @@ class PipelineManager:
             self._last_usage = time.time()
             return self._shape_pipeline, self._texture_pipeline, self._rembg
 
-    def unload(self, reason: str = "external request") -> None:
-        """Unload pipelines and free GPU memory. ``reason`` is logged so
-        operators can tell idle-timeout unloads from orchestrator-driven
-        peer-sidecar rotations (UNLOAD_SIDECARS=true) and cancel fanouts."""
+    def unload(self, reason: str = "external request") -> bool:
+        """Unload pipelines and free GPU memory; returns whether anything
+        was loaded. ``reason`` is logged so operators can tell idle-timeout
+        unloads from orchestrator-driven peer-sidecar rotations
+        (UNLOAD_SIDECARS=true) and cancel fanouts."""
         with self._lock:
-            self._unload_locked(reason)
+            return self._unload_locked(reason)
 
-    def _unload_locked(self, reason: str) -> None:
+    def _unload_locked(self, reason: str) -> bool:
         """``unload`` body for callers that already hold ``self._lock``."""
-        if self._shape_pipeline is not None:
+        was_loaded = self._shape_pipeline is not None
+        if was_loaded:
             logger.info("Unloading ML pipelines (%s)...", reason)
             del self._shape_pipeline
             self._shape_pipeline = None
@@ -226,6 +220,12 @@ class PipelineManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("ML pipelines unloaded, GPU memory freed")
+        return was_loaded
+
+    def status(self) -> tuple[bool, float | None]:
+        """(loaded, last_usage) snapshot for ``/state``."""
+        with self._lock:
+            return self._shape_pipeline is not None, self._last_usage
 
     def _checker_loop(self) -> None:
         """Background thread that checks for inactivity and unloads pipelines."""
@@ -315,14 +315,14 @@ def cancel_generation() -> dict[str, str]:
 
 
 # How long /unload waits for the in-flight request to reach a cancel
-# checkpoint. Sized to the live-stack memory manager's unload timeout.
+# checkpoint. Sized to the orchestrating memory manager's unload timeout.
 UNLOAD_WAIT_S = 30.0
 
 # Grace before /kill's os._exit so the 200 body reaches the caller.
 KILL_EXIT_DELAY_S = 0.2
 
-_kill_lock = threading.Lock()
-_dying = False
+# First /kill wins this lock and never releases; later calls see it held.
+_kill_once = threading.Lock()
 
 
 @app.post("/unload")
@@ -341,11 +341,9 @@ def unload_pipelines():
         )
         return JSONResponse(status_code=503, content={"status": "busy"})
     try:
-        with pipeline_manager._lock:
-            was_loaded = pipeline_manager._shape_pipeline is not None
-        pipeline_manager.unload(reason="external /unload request")
+        was_loaded = pipeline_manager.unload(reason="external /unload request")
     finally:
-        preemption.release_slot()
+        preemption.end()
     if was_loaded:
         return {"status": "unloaded"}
     return {"status": "already_unloaded"}
@@ -366,17 +364,12 @@ def _read_meminfo_kb() -> dict:
     return info
 
 
-_unified_memory_cached = None
-
-
+@functools.cache
 def _is_unified_memory() -> bool:
-    global _unified_memory_cached
-    if _unified_memory_cached is None:
-        try:
-            _unified_memory_cached = torch.cuda.get_device_properties(0).is_integrated
-        except Exception:
-            _unified_memory_cached = False
-    return _unified_memory_cached
+    try:
+        return torch.cuda.get_device_properties(0).is_integrated
+    except Exception:
+        return False
 
 
 def _vram_info_mb() -> tuple:
@@ -385,7 +378,6 @@ def _vram_info_mb() -> tuple:
     On unified-memory hosts (DGX Spark / GB10) ``torch.cuda.mem_get_info``
     reflects kernel MemFree only — page cache shows as used even though
     cudaMalloc can reclaim it — so report MemAvailable/MemTotal instead.
-    Mirrors shared/cuda_memory.vram_info_mb in the live-stack repo.
     """
     try:
         if not torch.cuda.is_available():
@@ -402,12 +394,11 @@ def _vram_info_mb() -> tuple:
         return None, None
 
 
-# --- Unified-memory page-cache survival (mirrors shared/cuda_memory.py in the
-# live-stack repo). On GB10, cudaMalloc fails when kernel MemFree is low even
-# though MemAvailable (reclaimable page cache) is plentiful; NVIDIA's
-# workaround is dropping the page cache. Requires a privileged container
-# (writable /proc/sys); silently skipped otherwise — no CPU-buffer fallback,
-# that thrashes once swap fills.
+# --- Unified-memory page-cache survival. On GB10, cudaMalloc fails when
+# kernel MemFree is low even though MemAvailable (reclaimable page cache) is
+# plentiful; NVIDIA's workaround is dropping the page cache. Requires a
+# privileged container (writable /proc/sys); silently skipped otherwise — no
+# CPU-buffer fallback, that thrashes once swap fills.
 
 _PAGE_CACHE_RESERVE_GB = int(os.environ.get("PAGE_CACHE_RESERVE_GB", "20"))
 _PAGE_CACHE_COOLDOWN_S = 5.0
@@ -472,11 +463,9 @@ _patch_module_to()
 
 @app.get("/state")
 def state() -> dict:
-    """Load/VRAM state for the live-stack memory manager (LRU eviction)."""
+    """Load/VRAM state for the orchestrating memory manager (LRU eviction)."""
     free_mb, total_mb = _vram_info_mb()
-    with pipeline_manager._lock:
-        loaded = pipeline_manager._shape_pipeline is not None
-        last = pipeline_manager._last_usage
+    loaded, last = pipeline_manager.status()
     return {
         "status": "ok" if loaded else "idle",
         "loaded": loaded,
@@ -497,16 +486,13 @@ def kill() -> JSONResponse:
 
     Unconditional by design (no idle short-circuit): the caller's use case is
     reclaiming memory that /unload could not free, which happens precisely
-    when the process is idle. Status contract matches the live-stack repo
-    (shared/lifecycle.py).
+    when the process is idle. Status contract matches the orchestrating
+    memory manager's kill convention.
     """
-    global _dying
-    with _kill_lock:
-        if _dying:
-            return JSONResponse(
-                content={"status": "already-killing", "exit_delay_s": KILL_EXIT_DELAY_S},
-            )
-        _dying = True
+    if not _kill_once.acquire(blocking=False):
+        return JSONResponse(
+            content={"status": "already-killing", "exit_delay_s": KILL_EXIT_DELAY_S},
+        )
     logger.warning("Kill requested; process will exit in %.1fs", KILL_EXIT_DELAY_S)
     return JSONResponse(
         content={"status": "killing", "exit_delay_s": KILL_EXIT_DELAY_S},

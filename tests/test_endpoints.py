@@ -3,6 +3,7 @@
 import io
 import os
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -306,7 +307,7 @@ class TestQueueModeBothSucceed:
 
 
 class TestState:
-    """GET /state — load/VRAM report for the live-stack memory manager."""
+    """GET /state — load/VRAM report for the orchestrating memory manager."""
 
     def test_unloaded(self, client):
         resp = client.get("/state")
@@ -321,10 +322,8 @@ class TestState:
     def test_loaded(self, client):
         # The client fixture stubs get_pipelines, so set the loaded state
         # directly on the manager.
-        import time as time_module
-
         pipeline_manager._shape_pipeline = MagicMock()
-        pipeline_manager._last_usage = time_module.time()
+        pipeline_manager._last_usage = time.time()
         try:
             body = client.get("/state").json()
             assert body["status"] == "ok"
@@ -336,30 +335,30 @@ class TestState:
 
 
 class TestKill:
-    """POST /kill — self-exit contract (live-stack shared/lifecycle.py)."""
+    """POST /kill — self-exit contract for the orchestrating memory manager."""
 
-    def test_kill_responds_then_exits(self, client):
+    @pytest.fixture
+    def mock_exit(self):
         import api as api_module
 
-        with patch.object(api_module.os, "_exit") as mock_exit, \
+        with patch.object(api_module.os, "_exit") as mocked, \
                 patch.object(api_module.time, "sleep"):
-            resp = client.post("/kill")
-            assert resp.status_code == 200
-            assert resp.json()["status"] == "killing"
-            # TestClient runs the BackgroundTask before returning.
-            mock_exit.assert_called_once_with(137)
-        # Reset the module dying flag for other tests.
-        api_module._dying = False
+            yield mocked
+        # Free the kill-once lock for other tests.
+        if api_module._kill_once.locked():
+            api_module._kill_once.release()
 
-    def test_second_kill_reports_already_killing(self, client):
-        import api as api_module
+    def test_kill_responds_then_exits(self, client, mock_exit):
+        resp = client.post("/kill")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "killing"
+        # TestClient runs the BackgroundTask before returning.
+        mock_exit.assert_called_once_with(137)
 
-        with patch.object(api_module.os, "_exit"), \
-                patch.object(api_module.time, "sleep"):
-            client.post("/kill")
-            resp = client.post("/kill")
-            assert resp.json()["status"] == "already-killing"
-        api_module._dying = False
+    def test_second_kill_reports_already_killing(self, client, mock_exit):
+        client.post("/kill")
+        resp = client.post("/kill")
+        assert resp.json()["status"] == "already-killing"
 
 
 class TestUnloadWaitsForSlot:
@@ -376,7 +375,7 @@ class TestUnloadWaitsForSlot:
             assert resp.status_code == 503
             assert resp.json()["status"] == "busy"
         finally:
-            api_module.preemption.release_slot()
+            api_module.preemption.end()
 
     def test_unload_idle_releases_slot(self, client):
         import api as api_module
@@ -386,33 +385,38 @@ class TestUnloadWaitsForSlot:
         assert resp.json()["status"] in ("unloaded", "already_unloaded")
         # Slot must be free again afterwards.
         assert api_module.preemption.wait_idle(timeout=1.0)
-        api_module.preemption.release_slot()
+        api_module.preemption.end()
 
 
 class TestPageCacheDrop:
     """free_page_cache_if_needed — unified-memory survival helper."""
 
-    def test_noop_on_discrete_gpu(self, monkeypatch):
+    @pytest.fixture
+    def drop_calls(self, monkeypatch):
+        """Stub _try_drop_caches and reset the cooldown; returns call log."""
+        import api as api_module
+
+        monkeypatch.setattr(api_module, "_page_cache_last_drop", 0.0)
+        calls = []
+        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
+        return calls
+
+    def test_noop_on_discrete_gpu(self, monkeypatch, drop_calls):
         import api as api_module
 
         monkeypatch.setattr(api_module, "_is_unified_memory", lambda: False)
-        calls = []
-        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
         api_module.free_page_cache_if_needed()
-        assert calls == []
+        assert drop_calls == []
 
-    def test_drops_when_memfree_low(self, monkeypatch):
+    def test_drops_when_memfree_low(self, monkeypatch, drop_calls):
         import api as api_module
 
         monkeypatch.setattr(api_module, "_is_unified_memory", lambda: True)
         monkeypatch.setattr(api_module, "_read_meminfo_kb", lambda: {"MemFree": 1024})
-        monkeypatch.setattr(api_module, "_page_cache_last_drop", 0.0)
-        calls = []
-        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
         api_module.free_page_cache_if_needed()
-        assert calls == [1]
+        assert drop_calls == [1]
 
-    def test_skips_when_memfree_high(self, monkeypatch):
+    def test_skips_when_memfree_high(self, monkeypatch, drop_calls):
         import api as api_module
 
         monkeypatch.setattr(api_module, "_is_unified_memory", lambda: True)
@@ -420,8 +424,5 @@ class TestPageCacheDrop:
             api_module, "_read_meminfo_kb",
             lambda: {"MemFree": (api_module._PAGE_CACHE_RESERVE_GB + 1) * 1024 * 1024},
         )
-        monkeypatch.setattr(api_module, "_page_cache_last_drop", 0.0)
-        calls = []
-        monkeypatch.setattr(api_module, "_try_drop_caches", lambda: calls.append(1) or True)
         api_module.free_page_cache_if_needed()
-        assert calls == []
+        assert drop_calls == []
