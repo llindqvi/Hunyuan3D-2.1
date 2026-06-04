@@ -303,3 +303,87 @@ class TestQueueModeBothSucceed:
             assert result1[0].status_code == 200
             assert result2[0] is not None
             assert result2[0].status_code == 200
+
+
+class TestState:
+    """GET /state — load/VRAM report for the live-stack memory manager."""
+
+    def test_unloaded(self, client):
+        resp = client.get("/state")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "idle"
+        assert body["loaded"] is False
+        assert body["last_activity_ts"] is None
+        assert "vram_free_mb" in body
+        assert "vram_total_mb" in body
+
+    def test_loaded(self, client):
+        # The client fixture stubs get_pipelines, so set the loaded state
+        # directly on the manager.
+        import time as time_module
+
+        pipeline_manager._shape_pipeline = MagicMock()
+        pipeline_manager._last_usage = time_module.time()
+        try:
+            body = client.get("/state").json()
+            assert body["status"] == "ok"
+            assert body["loaded"] is True
+            assert body["last_activity_ts"] is not None
+        finally:
+            pipeline_manager._shape_pipeline = None
+            pipeline_manager._last_usage = None
+
+
+class TestKill:
+    """POST /kill — self-exit contract (live-stack shared/lifecycle.py)."""
+
+    def test_kill_responds_then_exits(self, client):
+        import api as api_module
+
+        with patch.object(api_module.os, "_exit") as mock_exit, \
+                patch.object(api_module.time, "sleep"):
+            resp = client.post("/kill")
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "killing"
+            # TestClient runs the BackgroundTask before returning.
+            mock_exit.assert_called_once_with(137)
+        # Reset the module dying flag for other tests.
+        api_module._dying = False
+
+    def test_second_kill_reports_already_killing(self, client):
+        import api as api_module
+
+        with patch.object(api_module.os, "_exit"), \
+                patch.object(api_module.time, "sleep"):
+            client.post("/kill")
+            resp = client.post("/kill")
+            assert resp.json()["status"] == "already-killing"
+        api_module._dying = False
+
+
+class TestUnloadWaitsForSlot:
+    """POST /unload must not delete pipelines under an in-flight request."""
+
+    def test_unload_busy_503(self, client, monkeypatch):
+        import api as api_module
+
+        monkeypatch.setattr(api_module, "UNLOAD_WAIT_S", 0.05)
+        # Occupy the processing slot like an in-flight request would.
+        assert api_module.preemption.wait_idle(timeout=1.0)
+        try:
+            resp = client.post("/unload")
+            assert resp.status_code == 503
+            assert resp.json()["status"] == "busy"
+        finally:
+            api_module.preemption.release_slot()
+
+    def test_unload_idle_releases_slot(self, client):
+        import api as api_module
+
+        resp = client.post("/unload")
+        assert resp.status_code == 200
+        assert resp.json()["status"] in ("unloaded", "already_unloaded")
+        # Slot must be free again afterwards.
+        assert api_module.preemption.wait_idle(timeout=1.0)
+        api_module.preemption.release_slot()
