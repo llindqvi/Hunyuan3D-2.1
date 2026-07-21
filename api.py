@@ -167,8 +167,6 @@ class PipelineManager:
             from hy3dshape.rembg import BackgroundRemover
             from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
 
-            self._apply_torchvision_fix()
-
             t = time.time()
             logger.info("Loading shape generation pipeline...")
             model_path = 'tencent/Hunyuan3D-2.1'
@@ -196,8 +194,6 @@ class PipelineManager:
         try:
             from hy3dshape.rembg import BackgroundRemover
             from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-
-            self._apply_torchvision_fix()
 
             if self._rembg is None:
                 self._rembg = BackgroundRemover()
@@ -227,11 +223,16 @@ class PipelineManager:
         check_cancel = check_cancel or (lambda: None)
         with self._lock:
             load_start = time.time()
-            if self._shape_pipeline is None:
+            need_shape = self._shape_pipeline is None
+            need_texture = self._texture_pipeline is None
+            if need_shape or need_texture:
+                self._apply_torchvision_fix()
+            if need_shape:
                 self._load_shape_locked(check_cancel)
                 check_cancel()  # checkpoint: between the two pipeline loads
-            if self._texture_pipeline is None:
+            if need_texture:
                 self._load_texture_locked(check_cancel)
+            if need_shape or need_texture:
                 logger.info("All ML pipelines loaded in %.2fs", time.time() - load_start)
             self._last_usage = time.time()
             return self._shape_pipeline, self._texture_pipeline, self._rembg
@@ -245,6 +246,7 @@ class PipelineManager:
         """
         with self._lock:
             if self._texture_pipeline is None:
+                self._apply_torchvision_fix()
                 self._load_texture_locked(check_cancel)
             self._last_usage = time.time()
             return self._texture_pipeline, self._rembg
@@ -809,12 +811,15 @@ def _texture_mesh_to_glb(
     rembg: BackgroundRemoverType,
     cancel: threading.Event | None = None,
     use_remesh: bool = False,
+    output_name: str = "mesh",
 ) -> str:
     """Paint an externally-provided mesh with the texture pipeline.
 
     The texture half of ``_process_image_to_glb``: rembg the reference
     image, run the paint pipeline on ``mesh_path``, embed PBR textures and
-    return the textured GLB path.
+    return the textured GLB path. ``output_name`` names the output dir and
+    file (the uploaded mesh is staged under a fixed temp name, so the caller
+    passes the real filename stem here).
 
     Raises:
         PreemptedError: If the request is cancelled between stages
@@ -824,7 +829,7 @@ def _texture_mesh_to_glb(
             raise PreemptedError("Request preempted by a newer request")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    input_name = os.path.splitext(os.path.basename(mesh_path))[0]
+    input_name = output_name
     output_dir = os.path.join("outputs", f"{input_name}_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -858,6 +863,35 @@ def _texture_mesh_to_glb(
     _cleanup_texture_intermediates(output_mesh_path)
 
     return output_textured_glb
+
+
+def _apply_texture_config(
+    texture_pipeline: TexturePipeline,
+    *,
+    texture_steps: int,
+    texture_views: int,
+    fast_remesh: bool,
+    texture_resolution: int,
+    target_face_count: int | None = None,
+) -> None:
+    """Apply per-request overrides to the shared texture pipeline config.
+
+    The texture pipeline is a cached singleton, so every request that reuses
+    it must set the same set of fields — otherwise a field one endpoint sets
+    leaks into the next request that doesn't. ``resolution`` is read by the
+    pipeline at each call (forwarded as ``custom_view_size``), so mutating it
+    here changes the multiview render size without a reload. ``target_face_count``
+    left as None keeps the pipeline's own remesh default.
+    """
+    cfg = texture_pipeline.config
+    cfg.texture_steps = texture_steps
+    cfg.max_selected_view_num = texture_views
+    cfg.fast_remesh = fast_remesh
+    cfg.resolution = texture_resolution
+    cfg.target_face_count = target_face_count
+    multiview = texture_pipeline.models.get("multiview_model")
+    if hasattr(multiview, "num_inference_steps"):
+        multiview.num_inference_steps = texture_steps
 
 
 @app.post("/convert-image-to-3d", response_model=None)
@@ -920,16 +954,13 @@ def convert_image_to_3d(
         shape_pipeline, texture_pipeline, rembg = pipeline_manager.get_pipelines(
             check_cancel=lambda: preemption.check(cancel),
         )
-        # Apply per-request texture config overrides. `resolution` is read by
-        # the texture pipeline at each call (forwarded as `custom_view_size`),
-        # so mutating it here changes the multiview diffusion render size
-        # without a pipeline reload.
-        texture_pipeline.config.texture_steps = texture_steps
-        texture_pipeline.config.max_selected_view_num = texture_views
-        texture_pipeline.config.fast_remesh = fast_remesh
-        texture_pipeline.config.resolution = texture_resolution
-        if hasattr(texture_pipeline.models.get("multiview_model", None) or object(), "num_inference_steps"):
-            texture_pipeline.models["multiview_model"].num_inference_steps = texture_steps
+        _apply_texture_config(
+            texture_pipeline,
+            texture_steps=texture_steps,
+            texture_views=texture_views,
+            fast_remesh=fast_remesh,
+            texture_resolution=texture_resolution,
+        )
 
         output_path = _process_image_to_glb(
             temp_path, shape_pipeline, texture_pipeline, rembg, cancel,
@@ -1040,18 +1071,21 @@ def texture_mesh(
     )
     start_time = time.time()
 
-    # Own temp dir: the paint pipeline's remesh step writes intermediates next
-    # to the input mesh, so everything lands here and one rmtree cleans up.
-    temp_dir = tempfile.mkdtemp(prefix="texture_mesh_")
-    mesh_path = os.path.join(temp_dir, f"mesh.{mesh_extension}")
-    with open(mesh_path, "wb") as f:
-        f.write(mesh.file.read())
-    image_path = os.path.join(temp_dir, f"image.{image_extension}")
-    with open(image_path, "wb") as f:
-        f.write(image.file.read())
-
     cancel: threading.Event | None = None
+    temp_dir: str | None = None
     try:
+        # Own temp dir: the paint pipeline's remesh step writes intermediates
+        # next to the input mesh, so everything lands here and one rmtree
+        # cleans up. Staged under a fixed name; the real filename stem drives
+        # the output naming below.
+        temp_dir = tempfile.mkdtemp(prefix="texture_mesh_")
+        mesh_path = os.path.join(temp_dir, f"mesh.{mesh_extension}")
+        with open(mesh_path, "wb") as f:
+            f.write(mesh.file.read())
+        image_path = os.path.join(temp_dir, f"image.{image_extension}")
+        with open(image_path, "wb") as f:
+            f.write(image.file.read())
+
         cancel = preemption.begin(cancel_previous=cancel_previous)
         preemption.check(cancel)
         free_page_cache_if_needed()
@@ -1059,18 +1093,19 @@ def texture_mesh(
         texture_pipeline, rembg = pipeline_manager.get_texture_pipelines(
             check_cancel=lambda: preemption.check(cancel),
         )
-        # Same per-request config overrides as /convert-image-to-3d.
-        texture_pipeline.config.texture_steps = texture_steps
-        texture_pipeline.config.max_selected_view_num = texture_views
-        texture_pipeline.config.fast_remesh = fast_remesh
-        texture_pipeline.config.resolution = texture_resolution
-        texture_pipeline.config.target_face_count = target_face_count
-        if hasattr(texture_pipeline.models.get("multiview_model", None) or object(), "num_inference_steps"):
-            texture_pipeline.models["multiview_model"].num_inference_steps = texture_steps
+        _apply_texture_config(
+            texture_pipeline,
+            texture_steps=texture_steps,
+            texture_views=texture_views,
+            fast_remesh=fast_remesh,
+            texture_resolution=texture_resolution,
+            target_face_count=target_face_count,
+        )
 
         output_path = _texture_mesh_to_glb(
             mesh_path, image_path, texture_pipeline, rembg, cancel,
             use_remesh=use_remesh,
+            output_name=os.path.splitext(os.path.basename(mesh.filename))[0],
         )
         if smooth_normals:
             logger.info("Applying smooth normals to %s", output_path)
@@ -1107,7 +1142,8 @@ def texture_mesh(
     finally:
         if cancel is not None:
             preemption.end()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     filename = os.path.basename(output_path)
     return FileResponse(
