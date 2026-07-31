@@ -91,6 +91,22 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _to_trimesh(mesh_v, mesh_f):
+    """Build a Trimesh, dropping faces that touch non-finite vertices first.
+
+    The hierarchical volume decoders mark unevaluated grid cells with NaN, so
+    marching cubes emits NaN coordinates for vertices interpolated at the
+    evaluated/skipped boundary. Trimesh's process step removes those vertices
+    but silently remaps any face that references them to vertex 0, fanning
+    thousands of garbage triangles across the mesh. Filter those faces out
+    before construction so vertex removal never leaves dangling references.
+    """
+    finite = np.isfinite(mesh_v).all(axis=1)
+    if not finite.all():
+        mesh_f = mesh_f[finite[mesh_f].all(axis=1)]
+    return trimesh.Trimesh(mesh_v, mesh_f)
+
+
 @synchronize_timer('Export to trimesh')
 def export_to_trimesh(mesh_output):
     if isinstance(mesh_output, list):
@@ -100,13 +116,10 @@ def export_to_trimesh(mesh_output):
                 outputs.append(None)
             else:
                 mesh.mesh_f = mesh.mesh_f[:, ::-1]
-                mesh_output = trimesh.Trimesh(mesh.mesh_v, mesh.mesh_f)
-                outputs.append(mesh_output)
+                outputs.append(_to_trimesh(mesh.mesh_v, mesh.mesh_f))
         return outputs
     else:
-        mesh_output.mesh_f = mesh_output.mesh_f[:, ::-1]
-        mesh_output = trimesh.Trimesh(mesh_output.mesh_v, mesh_output.mesh_f)
-        return mesh_output
+        return _to_trimesh(mesh_output.mesh_v, mesh_output.mesh_f[:, ::-1])
 
 
 def get_obj_from_str(string, reload=False):
