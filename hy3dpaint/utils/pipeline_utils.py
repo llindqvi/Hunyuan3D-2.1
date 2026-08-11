@@ -37,76 +37,64 @@ class ViewProcessor:
 
         return position_maps
 
+    # A view earns its slot only if it adds this fraction of the bakeable surface.
+    min_view_texel_gain = 0.005
+
+    def _candidate_trust_maps(self, candidate_camera_elevs, candidate_camera_azims):
+        """Texels each candidate view would bake, from geometry alone.
+
+        back_project's cosine map depends only on the mesh and the camera, so the
+        footprint is known before any view image exists. The probe is rendered at
+        the same resolution the real bake uses -- a smaller one scatters fewer
+        pixels into the texture and would under-report coverage.
+        """
+        probe = np.zeros((self.config.render_size, self.config.render_size), dtype=np.float32)
+        trust_maps = []
+        for elev, azim in zip(candidate_camera_elevs, candidate_camera_azims):
+            _, cos_map, _ = self.render.back_project(probe, elev, azim)
+            trust_maps.append(cos_map.squeeze(-1) > 0)
+        return trust_maps
+
     def bake_view_selection(
         self, candidate_camera_elevs, candidate_camera_azims, candidate_view_weights, max_selected_view_num
     ):
+        """Pick the views to paint from, ranked by the texels they actually bake.
 
-        original_resolution = self.render.default_resolution
-        self.render.set_default_render_resolution(1024)
+        Ranking by newly-*rasterized triangle area* -- the previous criterion --
+        counts a triangle as covered once any view catches a single pixel of it at
+        any grazing angle. That proxy saturates right after the axis views, so the
+        search stopped at six views while a tenth of the surface still reached no
+        camera; those texels became inpaint blotches in concave regions (inner
+        legs, armpits). Trusted-texel coverage is what the bake consumes, so rank
+        on it directly and let max_selected_view_num be the real bound.
 
-        selected_camera_elevs = []
-        selected_camera_azims = []
-        selected_view_weights = []
-        selected_alpha_maps = []
-        viewed_tri_idxs = []
-        viewed_masks = []
+        The front view is always kept: it holds the highest bake weight and anchors
+        the texture to the reference image, and coverage alone would discard it.
+        """
+        trust_maps = self._candidate_trust_maps(candidate_camera_elevs, candidate_camera_azims)
+        bakeable = torch.stack(trust_maps).any(dim=0).sum().clamp(min=1)
 
-        # 计算每个三角片的面积
-        face_areas = self.render.get_face_areas(from_one_index=True)
-        total_area = face_areas.sum()
-        face_area_ratios = face_areas / total_area
-
-        candidate_view_num = len(candidate_camera_elevs)
-        self.render.set_boundary_unreliable_scale(2)
-
-        for elev, azim in zip(candidate_camera_elevs, candidate_camera_azims):
-            viewed_tri_idx = self.render.render_alpha(elev, azim, return_type="np")
-            viewed_tri_idxs.append(set(np.unique(viewed_tri_idx.flatten())))
-            viewed_masks.append(viewed_tri_idx[0, :, :, 0] > 0)
-
-        is_selected = [False for _ in range(candidate_view_num)]
-        total_viewed_tri_idxs = set()
-        total_viewed_area = 0.0
-
-        for idx in range(min(6, max_selected_view_num)):
-            selected_camera_elevs.append(candidate_camera_elevs[idx])
-            selected_camera_azims.append(candidate_camera_azims[idx])
-            selected_view_weights.append(candidate_view_weights[idx])
-            selected_alpha_maps.append(viewed_masks[idx])
-            is_selected[idx] = True
-            total_viewed_tri_idxs.update(viewed_tri_idxs[idx])
-
-        total_viewed_area = face_area_ratios[list(total_viewed_tri_idxs)].sum()
-        for iter in range(max_selected_view_num - len(selected_view_weights)):
-            max_inc = 0
-            max_idx = -1
-
-            for idx, (elev, azim, weight) in enumerate(
-                zip(candidate_camera_elevs, candidate_camera_azims, candidate_view_weights)
-            ):
-                if is_selected[idx]:
-                    continue
-                new_tri_idxs = viewed_tri_idxs[idx] - total_viewed_tri_idxs
-                new_inc_area = face_area_ratios[list(new_tri_idxs)].sum()
-
-                if new_inc_area > max_inc:
-                    max_inc = new_inc_area
-                    max_idx = idx
-
-            if max_inc > 0.01:
-                is_selected[max_idx] = True
-                selected_camera_elevs.append(candidate_camera_elevs[max_idx])
-                selected_camera_azims.append(candidate_camera_azims[max_idx])
-                selected_view_weights.append(candidate_view_weights[max_idx])
-                selected_alpha_maps.append(viewed_masks[max_idx])
-                total_viewed_tri_idxs = total_viewed_tri_idxs.union(viewed_tri_idxs[max_idx])
-                total_viewed_area += max_inc
-            else:
+        selected = [0]
+        covered = trust_maps[0].clone()
+        while len(selected) < max_selected_view_num:
+            gains = [
+                (int((trust_maps[idx] & ~covered).sum()), idx)
+                for idx in range(len(trust_maps))
+                if idx not in selected
+            ]
+            if not gains:
                 break
+            gain, best_idx = max(gains)
+            if gain / bakeable < self.min_view_texel_gain:
+                break
+            selected.append(best_idx)
+            covered |= trust_maps[best_idx]
 
-        self.render.set_default_render_resolution(original_resolution)
-
-        return selected_camera_elevs, selected_camera_azims, selected_view_weights
+        return (
+            [candidate_camera_elevs[idx] for idx in selected],
+            [candidate_camera_azims[idx] for idx in selected],
+            [candidate_view_weights[idx] for idx in selected],
+        )
 
     def bake_from_multiview(self, views, camera_elevs, camera_azims, view_weights):
         project_textures, project_weighted_cos_maps = [], []
