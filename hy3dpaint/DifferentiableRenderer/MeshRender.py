@@ -364,10 +364,6 @@ class MeshRender:
         self.max_mip_level = max_mip_level
         self.filter_mode = filter_mode
         self.bake_angle_thres = 75
-        # Bake trust within this many texels of a UV chart edge is discarded
-        # before inpainting (chart-edge texels carry extrapolated positions
-        # and can sample unrelated surfaces).
-        self.chart_edge_distrust_px = 2
         self.set_boundary_unreliable_scale(2)
         self.bake_mode = bake_mode
         self.shader_type = shader_type
@@ -1385,66 +1381,6 @@ class MeshRender:
 
         return texture_merge, trust_map_merge > 1e-8
 
-    def _fill_uv_holes_island_aware(self, texture_np, mask, max_fill_radius=64):
-        """Fill unseen on-surface texels from their own UV chart, then pad the
-        gutter, so the 2D inpaint that follows never pulls colors from
-        neighboring charts across the gutter.
-
-        Three steps:
-        1. Discard validity outside the rasterized UV coverage — the baker
-           writes low-trust texels slightly outside charts whose colors come
-           from extrapolated positions and are unreliable.
-        2. Diffuse valid colors into on-surface holes by iterative 3x3
-           averaging restricted to the coverage, so fill colors always come
-           from the same chart (up to max_fill_radius texels deep).
-        3. Pad everything still uncolored (the gutter, plus charts no view
-           ever saw) from the nearest colored texel.
-
-        Args:
-            texture_np: Texture as float numpy array (H, W, C)
-            mask: Validity mask as uint8 numpy array (H, W), nonzero = valid
-            max_fill_radius: Cap on the diffusion depth in texels
-
-        Returns:
-            Tuple of (texture_np, mask) with all texels colored and validated
-        """
-        if getattr(self, "texture_indices", None) is None:
-            return texture_np, mask
-        coverage = (self.texture_indices >= 0).cpu().numpy()
-        valid = (mask > 0) & coverage
-        if not valid.any():
-            return texture_np, mask
-
-        kernel = np.ones((3, 3), np.float32)
-        invalid = coverage & ~valid
-        for _ in range(max_fill_radius):
-            if not invalid.any():
-                break
-            cnt = cv2.filter2D(valid.astype(np.float32), -1, kernel)
-            ring = invalid & (cnt > 0)
-            if not ring.any():
-                break
-            acc = cv2.filter2D(texture_np * valid[..., None], -1, kernel)
-            texture_np[ring] = acc[ring] / cnt[ring, None]
-            valid |= ring
-            invalid &= ~ring
-
-        # Pad the rest (gutter + unseen charts) from the nearest colored
-        # texel via distance-transform labels: valid pixels carry their own
-        # label, so a LUT indexed by label yields the nearest coordinates.
-        _, labels = cv2.distanceTransformWithLabels(
-            (~valid).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
-        )
-        coords = np.argwhere(valid)
-        lut = np.zeros((labels.max() + 1, 2), np.int32)
-        lut[labels[valid]] = coords
-        rest = ~valid
-        src = lut[labels[rest]]
-        texture_np[rest] = texture_np[src[:, 0], src[:, 1]]
-
-        mask = np.full_like(mask, 255)
-        return texture_np, mask
-
     @torch.no_grad()
     def uv_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", return_float=False):
         """
@@ -1471,29 +1407,51 @@ class MeshRender:
         if isinstance(mask, torch.Tensor):
             mask = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
 
-        if getattr(self, "texture_indices", None) is not None:
-            # Chart-edge texels are rasterized with extrapolated barycentric
-            # positions: they can project onto unrelated geometry, pass the
-            # bake depth test against that surface, and carry its color as
-            # trusted data. Distrust the whole edge ring (and the gutter)
-            # before the vertex pass reads texel colors through the mask;
-            # the island-aware fill below re-colors the ring from the chart
-            # interior instead.
-            coverage = (self.texture_indices >= 0).cpu().numpy().astype(np.uint8)
-            k = self.chart_edge_distrust_px * 2 + 1
-            core = cv2.erode(coverage, np.ones((k, k), np.uint8))
-            mask = mask * core.astype(mask.dtype)
-
         if vertex_inpaint:
             vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
             texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
             texture_np = np.asarray(texture_np)
             mask = np.asarray(mask)
 
-        texture_np, mask = self._fill_uv_holes_island_aware(texture_np, mask)
+        pre_ns_mask = mask
 
         if method == "NS":
             texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_NS)
             assert return_float == False
 
+        texture_np = self._repair_spot_outliers(texture_np, pre_ns_mask)
+
         return texture_np
+
+    def _repair_spot_outliers(self, texture_u8, pre_ns_mask, ring_px=3, dev_thres=150):
+        """Median-repair texels that deviate hard from their surroundings, but
+        only in the two zones where bake colors are unreliable: the chart-edge
+        ring (texels rasterized with extrapolated positions can sample
+        unrelated surfaces) and texels no view painted (inpaint-filled).
+        Chart interiors that a view actually saw are never touched, so real
+        texture detail survives.
+
+        Args:
+            texture_u8: Texture as uint8 numpy array (H, W, C)
+            pre_ns_mask: Validity mask before the 2D inpaint, nonzero = seen
+            ring_px: Width of the chart-edge zone in texels
+            dev_thres: Summed-RGB deviation from the local median that marks
+                a texel as an outlier
+
+        Returns:
+            Repaired texture as uint8 numpy array
+        """
+        if getattr(self, "texture_indices", None) is None:
+            return texture_u8
+        coverage = (self.texture_indices >= 0).cpu().numpy()
+        k = ring_px * 2 + 1
+        core = cv2.erode(coverage.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+        zone = coverage & (~core | (pre_ns_mask == 0))
+        if not zone.any():
+            return texture_u8
+
+        med = cv2.medianBlur(texture_u8, 25)
+        dev = np.abs(texture_u8.astype(np.int16) - med.astype(np.int16)).sum(-1)
+        outlier = (dev > dev_thres) & zone
+        texture_u8[outlier] = med[outlier]
+        return texture_u8
