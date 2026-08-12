@@ -29,6 +29,7 @@ from utils.multiview_utils import multiviewDiffusionNet
 from utils.pipeline_utils import ViewProcessor
 from utils.image_super_utils import imageSuperNet
 from utils.uvwrap_utils import mesh_uv_wrap
+from utils.surface_despeckle import despeckle
 from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
 import warnings
 
@@ -59,6 +60,7 @@ class Hunyuan3DPaintConfig:
         self.texture_steps = texture_steps
         self.fast_remesh = False
         self.target_face_count = None  # None -> remesh_mesh's default
+        self.despeckle = True  # repair invented shards left by texture_inpaint
 
         # view selection
         self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
@@ -228,6 +230,14 @@ class Hunyuan3DPaintPipeline:
         ##########  inpaint  ###########
         t = time.time()
         texture = self.view_processor.texture_inpaint(texture, mask_np)
+        # texture_inpaint invents every texel no camera reached, diffusing colour
+        # across the atlas where UV neighbours are unrelated surfaces. That is what
+        # leaves hard-edged foreign shards on shoulders, inner legs and armpits.
+        if getattr(self.config, "despeckle", True):
+            t_despeckle = time.time()
+            vtx_pos, pos_idx, vtx_uv, uv_idx = self.render.get_mesh()
+            texture = despeckle(texture, mask_np, vtx_pos, pos_idx, vtx_uv, uv_idx)
+            logger.info("    Surface despeckle: %.2fs", time.time() - t_despeckle)
         self.render.set_texture(texture, force_set=True)
         if "mr" in enhance_images:
             texture_mr = self.view_processor.texture_inpaint(texture_mr, mask_mr_np)
