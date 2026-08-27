@@ -20,6 +20,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 import torch
+from accelerate import init_empty_weights
 import trimesh
 import yaml
 from PIL import Image
@@ -178,15 +179,37 @@ class Hunyuan3DDiTPipeline:
                     ckpt[model_name] = {}
                 ckpt[model_name][new_key] = value
         else:
-            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            # Read the pickle straight onto the target device: it lands in
+            # anonymous host memory first and relocates at full bandwidth, so
+            # nothing holds a resident CPU copy of the weights. (The
+            # safetensors branch above deliberately stays on CPU — reading a
+            # memory-mapped file to the device copies weight by weight from the
+            # mmap and crawls.)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         # load model
-        model = instantiate_from_config(config['model'])
-        model.load_state_dict(ckpt['model'])
-        vae = instantiate_from_config(config['vae'])
-        vae.load_state_dict(ckpt['vae'], strict=False)
-        conditioner = instantiate_from_config(config['conditioner'])
+        #
+        # Build the graphs without the weights the checkpoint supplies: a normal
+        # build allocates and random-initializes 3.68 B parameters in fp32 for
+        # the loads below to overwrite from an fp16 file, and `self.to(device,
+        # dtype)` in __init__ then casts the result back down. `assign=True`
+        # rebinds the loaded tensors instead of copying into fresh ones, which
+        # also keeps them in the file's dtype and makes that cast a no-op.
+        #
+        # `include_buffers=False` leaves buffer factories on CPU, so state the
+        # checkpoint does not carry — the Fourier embedder's frequencies, which
+        # are registered non-persistent — still materializes.
+        with init_empty_weights(include_buffers=False):
+            model = instantiate_from_config(config['model'])
+            vae = instantiate_from_config(config['vae'])
+            conditioner = instantiate_from_config(config['conditioner'])
+        model.load_state_dict(ckpt['model'], assign=True)
+        # strict=False is upstream's: the VAE checkpoint is a subset. With
+        # `assign` a key it omits stays on the meta device rather than keeping a
+        # random initialization, so the caller is expected to check for meta
+        # tensors after loading (ai-team: shared.model_load).
+        vae.load_state_dict(ckpt['vae'], strict=False, assign=True)
         if 'conditioner' in ckpt:
-            conditioner.load_state_dict(ckpt['conditioner'])
+            conditioner.load_state_dict(ckpt['conditioner'], assign=True)
         image_processor = instantiate_from_config(config['image_processor'])
         scheduler = instantiate_from_config(config['scheduler'])
 
